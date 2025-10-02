@@ -65,6 +65,7 @@ public:
     {
         None,
         MinMax,
+        PreWherePartition,
         Partition,
         PrimaryKey,
         Skip,

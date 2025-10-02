@@ -38,6 +38,7 @@
 #include <DataTypes/DataTypeEnum.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeIPv4andIPv6.h>
 #include <Functions/FunctionFactory.h>
 #include <base/sleep.h>
 #include <Common/LoggingFormatStringHelpers.h>
@@ -46,6 +47,7 @@
 #include <Common/FailPoint.h>
 #include <Common/ProfileEvents.h>
 #include <Common/quoteString.h>
+#include <Functions/FunctionsComparison.h>
 
 #include <IO/WriteBufferFromOStream.h>
 
@@ -567,6 +569,90 @@ std::optional<std::unordered_set<String>> MergeTreeDataSelectExecutor::filterPar
     return VirtualColumnUtils::extractSingleValueFromBlock<String>(virtual_columns_block, "_part");
 }
 
+
+namespace
+{
+
+    String extractPartitionPrefix(const StorageMetadataPtr & metadata_snapshot, const PrewhereInfoPtr & prewhere_info)
+    {
+        if (!metadata_snapshot->hasPartitionKey() || !prewhere_info)
+            return "";
+
+        // Only partition ids in the form "firstKey-secondKey[-otherKeys...]" can be searched by prefix.
+        // Partition id has such form if all keys are integer (see MergeTreePartition::getID).
+        // (The other partition id type is hash, we cannot handle them.)
+        for (const auto & partition_key_type : metadata_snapshot->partition_key.data_types)
+        {
+            if (!partition_key_type->isValueRepresentedByInteger())
+            {
+                return "";
+            }
+        }
+
+        // For simplicity, handle only multiple-column partitions, where '-' is used as a separator.
+        if (metadata_snapshot->partition_key.column_names.size() < 2)
+            return "";
+
+        // We expect the last output of prewhere actions to be the one.
+        // Here is the only straight-forward case of `PARTITION_KEY_COLUMN_0 = val` is handled:
+        //  - if the output is a function "equals",
+        //  - its right argument is a fixed value (a column without a function to calculate it),
+        //  - and its left argument is the first partition key column;
+        //  then the right argument's column (only) value will be the `val`.
+        if (const auto * output = prewhere_info->prewhere_actions.getOutputs().back();
+            output->type == ActionsDAG::ActionType::FUNCTION && output->function->getName() == NameEquals::name
+            && output->children[1]->type == ActionsDAG::ActionType::COLUMN && output->children[1]->function == nullptr
+            && output->children[0]->type == ActionsDAG::ActionType::INPUT
+            && output->children[0]->result_name == metadata_snapshot->partition_key.column_names[0])
+        {
+            // We must convert `val` to the canonical form for its type in the partition id.
+            const auto * col_type = metadata_snapshot->partition_key.data_types[0].get();
+            const auto val = convertFieldToType((*output->children[1]->column)[0], *col_type);
+
+            String result;
+            // copied from MergeTreePartition::getID
+            if (typeid_cast<const DataTypeDate *>(col_type))
+                result = toString(DateLUT::instance().toNumYYYYMMDD(DayNum(val.safeGet<UInt64>())));
+            else if (typeid_cast<const DataTypeIPv4 *>(col_type))
+                result = toString(val.safeGet<IPv4>().toUnderType());
+            else
+                result = convertFieldToString(val);
+
+            return result + '-';
+        }
+        return "";
+    }
+
+    void filterPartsByPartitionPrefix(
+        RangesInDataParts & parts,
+        const String& partition_prefix)
+    {
+        if (partition_prefix.empty())
+            return;
+
+        // Select spans with names prefixed by `partition_prefix`.
+        const auto span = std::ranges::equal_range(
+            parts, partition_prefix,
+            [](const String& first, const String& second)
+            {
+                // 'less', except that it treats a string as equal to its prefix
+                return first.size() < second.size()
+                           ? first < std::string_view{second.data(), first.size()}
+                           : std::string_view{first.data(), second.size()} < second;
+            },
+            [](const auto& part) { return part.data_part->name; });
+
+        if (span.size() == parts.size())
+            return;
+
+        DataPartsVector parts_vector;
+        std::ranges::transform(span, std::back_inserter(parts_vector),
+            [](const auto part) {return part.data_part;});
+        parts = RangesInDataParts{parts_vector};
+    }
+}
+
+
 void MergeTreeDataSelectExecutor::filterPartsByPartition(
     RangesInDataParts & parts,
     const std::optional<PartitionPruner> & partition_pruner,
@@ -575,6 +661,7 @@ void MergeTreeDataSelectExecutor::filterPartsByPartition(
     const StorageMetadataPtr & metadata_snapshot,
     const MergeTreeData & data,
     const ContextPtr & context,
+    const SelectQueryInfo & query_info,
     const PartitionIdToMaxBlock * max_block_numbers_to_read,
     LoggerPtr log,
     ReadFromMergeTree::IndexStats & index_stats)
@@ -599,6 +686,9 @@ void MergeTreeDataSelectExecutor::filterPartsByPartition(
 
     auto query_context = context->hasQueryContext() ? context->getQueryContext() : context;
     QueryStatusPtr query_status = context->getProcessListElement();
+
+    const auto partition_prefix = extractPartitionPrefix(metadata_snapshot, query_info.prewhere_info);
+    filterPartsByPartitionPrefix(parts, partition_prefix);
 
     PartFilterCounters part_filter_counters;
     if (query_context->getSettingsRef()[Setting::allow_experimental_query_deduplication])

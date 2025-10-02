@@ -97,6 +97,9 @@ public:
         VectorSimilarityIndexCache * vector_similarity_index_cache,
         LoggerPtr log);
 
+
+    using DataPartsSpan = std::span<const RangesInDataPart>;
+
 private:
     const MergeTreeData & data;
     LoggerPtr log;
@@ -184,6 +187,7 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         const MergeTreeData & data,
         const ContextPtr & context,
+        const SelectQueryInfo & query_info,
         const PartitionIdToMaxBlock * max_block_numbers_to_read,
         LoggerPtr log,
         ReadFromMergeTree::IndexStats & index_stats);

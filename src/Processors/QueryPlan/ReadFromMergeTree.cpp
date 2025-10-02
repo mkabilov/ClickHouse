@@ -2048,6 +2048,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
             metadata_snapshot,
             data,
             context_,
+            query_info_,
             max_block_numbers_to_read.get(),
             log,
             result.index_stats);
@@ -2739,6 +2740,8 @@ static const char * indexTypeToString(ReadFromMergeTree::IndexType type)
             return "None";
         case ReadFromMergeTree::IndexType::MinMax:
             return "MinMax";
+        case ReadFromMergeTree::IndexType::PreWherePartition:
+            return "PreWherePartition";
         case ReadFromMergeTree::IndexType::Partition:
             return "Partition";
         case ReadFromMergeTree::IndexType::PrimaryKey:
@@ -2916,7 +2919,7 @@ void ReadFromMergeTree::describeIndexes(FormatSettings & format_settings) const
             format_settings.out << '\n';
 
             format_settings.out << prefix << indent << indent << "Granules: " << stat.num_granules_after;
-            if (i)
+            if (i && (index_stats[i - 1].num_granules_after || !index_stats[i - 1].num_parts_after))
                 format_settings.out << '/' << index_stats[i - 1].num_granules_after;
             format_settings.out << '\n';
 
